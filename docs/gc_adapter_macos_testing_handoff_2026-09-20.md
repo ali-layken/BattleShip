@@ -16,11 +16,16 @@ whichever one wins matters.
   it, the OS won't start the device at all, so nothing can use it.
 - **macOS:** unrun. The open question is whether libusb can claim interface 0
   while Apple's HID driver owns the device.
-- **The one test that matters most is Test 2.** If libusb *cannot* claim the
-  adapter on macOS, this PR makes the adapter unusable on a Mac where it
-  previously worked fine as a plain SDL gamepad — because the SDL ignore is
-  registered unconditionally at startup. That would be a macOS regression and a
-  merge blocker.
+- **Update (2026-09-20, later):** the unconditional SDL ignore that made Test 2
+  a potential merge blocker **has been fixed**, and access failures are now
+  reported instead of being silent. `Start()` makes one synchronous open attempt
+  before the reader thread, and the SDL ignore is registered *only* if that
+  claimed the device. So if libusb cannot claim the adapter on macOS, it now
+  falls back to being an ordinary SDL gamepad automatically.
+- **The most valuable test is now Test 3 (hotplug).** The fix moved the risk:
+  an adapter plugged in *after* startup is claimed by the reader thread without
+  SDL being told to ignore it, so on macOS — the one platform where both
+  backends can see the device — that is where doubled input could show up.
 
 ## Getting the right branches
 
@@ -32,27 +37,26 @@ merged. A plain `git submodule update --init` fails to find the commit.
 ```bash
 # superproject - ali-layken/BattleShip, branch feature/gc-adapter
 git fetch origin
-git checkout feature/gc-adapter          # -> 9051a41
+git checkout feature/gc-adapter          # -> fc1cd7e
 git submodule update --init --recursive  # libultraship WILL fail here - expected
 
 # point the submodule at the fork that actually has the commit
 git -C libultraship remote set-url origin https://github.com/ali-layken/libultraship.git
 git -C libultraship fetch origin
-git -C libultraship checkout 1c6e5f1c    # tip of feature/gc-adapter
+git -C libultraship checkout 3c1fdce9    # tip of feature/gc-adapter
 ```
 
 Verify before building:
 
 ```bash
-git rev-parse --short HEAD                   # -> 9051a41
-git -C libultraship rev-parse --short HEAD   # -> 1c6e5f1c
+git rev-parse --short HEAD                   # -> fc1cd7e
+git -C libultraship rev-parse --short HEAD   # -> 3c1fdce9
 git submodule status libultraship            # no leading +/- once correct
 ```
 
-Each branch is three commits: the feature commit, a follow-up, and a revert of
-most of that follow-up. The **net** change against the feature commit is 21
-lines in the no-libusb stub — nothing that compiles on macOS differs from what
-was tested on Linux.
+Each branch is now two commits: the squashed feature commit, plus a follow-up
+adding the access-failure diagnostics and the conditional SDL ignore described
+above. Both of those *do* compile on macOS and change what you will see.
 
 Do **not** commit a `.gitmodules` URL change. On the Windows box that edit was
 made locally and deliberately kept out of every commit; the PR must keep
@@ -93,6 +97,33 @@ grep -iE 'gcadapter|0337|another input backend' logs/BattleShip.log
 
 ---
 
+## Device access per platform — why macOS needs nothing
+
+Worth stating plainly, because it has confused people: **udev is Linux-only.**
+There are no udev rules on macOS, nothing to check and nothing to install. If
+someone asks you to look at the Mac's udev rules, that question doesn't apply.
+
+| Platform | Required setup | Status |
+|---|---|---|
+| Linux | udev rule granting the user access to `057e:0337` | verified |
+| Windows | adapter bound to the **WinUSB** driver (Zadig / Dolphin's installer) | verified |
+| macOS | **nothing** — plug it in | unverified, this handoff |
+
+The Linux rule is now documented in `BUILDING.md`. It was verified in isolation:
+with Dolphin's, Steam's (`steam-devices`) and every other `057e` rule disabled,
+this rule alone is enough —
+
+```
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="0337", MODE="0660", TAG+="uaccess"
+```
+
+`TAG+="uaccess"` is the load-bearing part: it makes `73-seat-late.rules` grant
+the logged-in user an ACL on the node. Also confirmed on Linux: **no
+auto-detach udev rule is needed.** With `usbhid` deliberately bound to the
+interface, `libusb_set_auto_detach_kernel_driver()` kicked it off at claim time
+and the driver worked. That call is Linux-only, which is exactly why the macOS
+claim in Test 1 is the open question.
+
 ## Test 1 — does libusb claim the adapter at all?
 
 Plug the adapter in **before** launching, then read the log.
@@ -115,14 +146,18 @@ ConnectedPhysicalDeviceManager: globally ignoring SDL gamepads 057e:0337 (claime
 Expect `hotplug=true` on macOS — libusb supports hotplug on darwin. Windows
 reports `false` and falls back to a one-second retry loop.
 
-**Not claimed:** no `adapter opened` line. You may see
-`found adapter but could not claim it: <code>` — capture the exact code, since
-`ACCESS`, `BUSY` and `NOT_SUPPORTED` point at different causes.
+**Not claimed:** no `adapter opened` line. There are now two distinct messages,
+and which one you get says where it broke:
 
-You may equally see **nothing at all**. That is a known reporting gap, not a
-crash: `TryOpen` bails early when `libusb_open_device_with_vid_pid` returns
-NULL, and the warning lives after that call, on the claim failure. Silence
-means "open failed", which is itself the useful signal. Confirmed on Windows.
+- `adapter is connected but could not be opened: <code>. To use it natively, …`
+  — `libusb_open` itself failed.
+- `opened the adapter but could not claim interface 0: <code>. The OS or another
+  process is holding it; … Leaving the adapter to the SDL input path.` — the
+  interesting macOS case: IOKit HID is holding it.
+
+Capture the exact code either way; `ACCESS`, `BUSY` and `NOT_SUPPORTED` point at
+different causes. The earlier "you may see nothing at all" reporting gap is
+fixed — silence now genuinely means the adapter was not detected at all.
 
 Useful context either way:
 
@@ -139,22 +174,26 @@ right.
 
 **Only meaningful if Test 1 failed.** If Test 1 succeeded, skip to Test 3.
 
-The SDL ignore for `057e:0337` is registered unconditionally at startup,
-before SDL initialises, whether or not an adapter is present or claimed. On
-Windows that costs nothing, because without WinUSB the OS refuses to start the
-device and SDL can't see it anyway. **On macOS the adapter is a perfectly good
-HID device**, so if libusb can't claim it, that ignore takes away a gamepad
-that would otherwise have worked.
+This used to be the merge blocker; it should now be handled. The SDL ignore is
+registered only when the startup claim actually succeeded, so a failed claim
+should leave `057e:0337` visible to SDL. You should see this line instead:
+
+```
+ControlDeck::PreInitGCAdapter: no adapter claimed at startup; leaving 057e:0337 to SDL
+```
+
+**On macOS the adapter is a perfectly good HID device**, so the fallback is
+what keeps it usable. This test now confirms the fix rather than hunting a
+regression.
 
 Check: with the adapter connected and unclaimed, does it appear as an SDL
 gamepad row in the input editor, and can you map and use a button?
 
-- **Unusable** — nothing in the input editor, no input anywhere: this is a
-  **macOS regression** introduced by the PR, and a merge blocker. Report it on
-  #8 with the Test 1 log rather than fixing it blind; the real fix is to track
-  claim state and apply or remove the ignore from the reader thread instead of
-  deciding once at startup, which is a bigger change than it looks.
-- **Usable as an SDL gamepad** — the fallback works and this is a non-issue.
+- **Usable as an SDL gamepad** — the fallback works as designed. Expected.
+- **Unusable** — nothing in the input editor, no input anywhere: the fallback is
+  not working and this *is* a macOS regression and a merge blocker. Report it on
+  #8 together with the Test 1 log and the `PreInitGCAdapter` line above, rather
+  than fixing it blind.
 
 Sanity check that the ignore is what's responsible, rather than something else,
 by relaunching with `gControllers.GCAdapter.Enabled=0`. That returns before the
@@ -167,10 +206,16 @@ the cause.
 Launch with the adapter **unplugged**, reach a point where you can see input,
 then plug it in.
 
-Expected: the ignore is registered at startup with nothing connected, and
-`adapter opened` + `port N controller connected` follow when the adapter
-appears. On macOS this should come from a hotplug event rather than the retry
-loop (`hotplug=true`).
+Expected: with nothing connected at startup the ignore is **not** registered
+(you will see the `leaving 057e:0337 to SDL` line), and `adapter opened` +
+`port N controller connected` follow when the adapter appears. On macOS this
+should come from a hotplug event rather than the retry loop (`hotplug=true`).
+
+**This is the known gap the fix introduced, and macOS is the only place it can
+bite.** Because SDL was never told to ignore the device, a late-arriving adapter
+can be read by libusb *and* by SDL at the same time. On Linux the kernel HID
+driver is detached on claim, and on Windows a WinUSB-bound adapter is invisible
+to SDL, so neither can double up. Please test this case deliberately.
 
 Watch for **doubled input** — one press registering twice, or a stick reading
 double deflection. That would mean SDL opened the adapter alongside libusb.
